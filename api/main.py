@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from database.connect import get_db
 from app import crud
 from api.schemas import PatientCreate, PatientUpdate, PatientResponse
+from api.vapi_tools import TOOL_DISPATCH
 
 # Logs to stdout by default — satisfies the "log agent conversations / the
 # final collected data payload to stdout" requirement. Whatever hosts this
@@ -132,3 +133,37 @@ def delete_patient(patient_id: UUID, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Patient not found")
     crud.soft_delete_patient(db, patient)
     return {"data": {"patient_id": str(patient_id), "deleted": True}, "error": None}
+
+# --- Vapi webhook -----------------------------------------------------------
+# One endpoint handles every tool call, regardless of which tool was
+# invoked. Vapi POSTs a payload naming the tool + its arguments; we look it
+# up in TOOL_DISPATCH and run the matching function. Errors are caught here
+# (not left to the exception handlers above) because Vapi expects a
+# {"results": [...]} shape no matter what happens — a raw 500 or our
+# {"data","error"} envelope wouldn't be understood by Vapi's side.
+ 
+@app.post("/vapi/tool-calls")
+def vapi_tool_calls(payload: dict, db: Session = Depends(get_db)):
+    tool_calls = payload.get("message", {}).get("toolCallList", [])
+    results = []
+    for call in tool_calls:
+        call_id = call.get("id")
+        name = call.get("name")
+        args = call.get("arguments") or {}
+        handler = TOOL_DISPATCH.get(name)
+ 
+        if handler is None:
+            result = f"Unknown tool '{name}'."
+        else:
+            try:
+                result = handler(db, dict(args))
+            except Exception:
+                # Covers the "DB write fails mid-call" case: the caller
+                # gets a spoken error instead of the call silently hanging.
+                logger.error("Vapi tool '%s' failed", name, exc_info=True)
+                result = "Something went wrong saving that on our end. Let's try that again in a moment."
+ 
+        logger.info("Vapi tool call: name=%s args=%s result=%s", name, args, result)
+        results.append({"toolCallId": call_id, "result": result})
+ 
+    return {"results": results}

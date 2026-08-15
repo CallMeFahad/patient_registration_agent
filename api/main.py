@@ -7,17 +7,26 @@ make that consistent even for errors FastAPI generates itself (validation
 errors, 404s) rather than ones we raise by hand in each endpoint.
 """
 
+import logging
 from uuid import UUID
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database.connect import get_db
 from app import crud
 from api.schemas import PatientCreate, PatientUpdate, PatientResponse
+
+# Logs to stdout by default — satisfies the "log agent conversations / the
+# final collected data payload to stdout" requirement. Whatever hosts this
+# (Railway, your terminal) captures stdout automatically, so no log file
+# management is needed for a project this size.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("patient_api")
 
 app = FastAPI(title="Patient Registration API")
 
@@ -37,6 +46,34 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     # exc.errors() is Pydantic's structured list of what failed and why —
     # more useful to a caller than a generic "bad request".
     return JSONResponse(status_code=422, content={"data": None, "error": exc.errors()})
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(request: Request, exc: IntegrityError):
+    # Raised when a write violates a DB-level CHECK/NOT NULL constraint —
+    # e.g. something Pydantic's validators didn't catch. This is the
+    # "database write fails" case the spec calls out: the caller gets a
+    # clean 422, not silence and not a raw Postgres stack trace.
+    logger.warning("DB constraint violation: %s", exc)
+    return JSONResponse(status_code=422, content={"data": None, "error": "Invalid data — could not save patient record"})
+
+
+@app.exception_handler(SQLAlchemyError)
+async def db_error_handler(request: Request, exc: SQLAlchemyError):
+    # Catches anything else DB-related (e.g. connection dropped mid-query).
+    # Also the caller's fallback if the write genuinely fails for reasons
+    # outside their control — still a clean envelope, never a silent crash.
+    logger.error("Unexpected database error: %s", exc)
+    return JSONResponse(status_code=500, content={"data": None, "error": "Database error — please try again"})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Last-resort catch-all so no bug anywhere in the app can produce a bare
+    # 500 with no body. The voice agent always gets *something* it can
+    # relay to the caller as a graceful error message, never a silent hang.
+    logger.error("Unhandled exception: %s", exc, exc_info=True)
+    return JSONResponse(status_code=500, content={"data": None, "error": "Internal server error"})
 
 
 # --- Health check ---------------------------------------------------------
@@ -72,6 +109,10 @@ def get_patient(patient_id: UUID, db: Session = Depends(get_db)):
 @app.post("/patients", status_code=201)
 def create_patient(patient_in: PatientCreate, db: Session = Depends(get_db)):
     patient = crud.create_patient(db, patient_in)
+    logger.info(
+        "Patient registered: patient_id=%s name=%s %s phone=%s",
+        patient.patient_id, patient.first_name, patient.last_name, patient.phone_number,
+    )
     return {"data": PatientResponse.model_validate(patient).model_dump(mode="json"), "error": None}
 
 
